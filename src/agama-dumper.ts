@@ -24,7 +24,7 @@ program
   .option("-d, --debug", "Enable debugging")
   .option("-u, --url <url>", "Agama server URL", "https://agama.local")
   .option("-p, --password <password>", "Agama login password")
-  .option("-o, --output <file>", "Save output to file (default: stdout)");
+  .option("-o, --output <dir>", "Output directory for the dump files", "dump");
 
 program.parse();
 const options = program.opts();
@@ -172,26 +172,13 @@ function expandPath(name: string, data: any): string[] {
   return values(data).map((value) => name.replace(/\{[^}]+\}/, encodeURIComponent(value)));
 }
 
-async function apiDownload(
-  url: string,
-  apiPath: string,
-  token: string,
-  data: any,
-  language?: string
-) {
+// download a path and store the result in the target object
+async function apiDownload(url: string, apiPath: string, token: string, target: any) {
   warn(`Downloading ${apiPath}`);
   // remove trailing slash from the path
   const requestPath = apiPath.replace(/\/$/, "");
   const res = await api(url + requestPath, token);
-
-  if (language) {
-    if (!data[language]) {
-      data[language] = {};
-    }
-    data[language][requestPath] = res;
-  } else {
-    data[requestPath] = res;
-  }
+  target[requestPath] = res;
 }
 
 // run an installer action, see the POST /api/action in the OpenAPI specification
@@ -235,8 +222,9 @@ function switchLanguage(url: string, token: string, language: string) {
   return runAction(url, token, { configureL10n: { locale: language } });
 }
 
+// download the translated paths for all supported languages, resolves to an object
+// with the data for each language
 async function localizedPaths(
-  data: any,
   url: string,
   token: string,
   localized: string[],
@@ -248,12 +236,13 @@ async function localizedPaths(
 
   if (!languages) {
     warn("No languages found, skipping localized paths");
-    return;
+    return {};
   }
 
   // remember the original language to restore it at the end
   const system = await api(url + "/api/system", token);
   const originalLanguage: string | undefined = system?.l10n?.locale;
+  const result: Record<string, any> = {};
 
   try {
     for (const language in languages) {
@@ -263,13 +252,16 @@ async function localizedPaths(
       warn("Switching UI language to " + uiLanguage);
       await switchLanguage(url, token, uiLanguage);
 
+      const langData: any = {};
+      result[language] = langData;
+
       for (const localizedPath of localized) {
-        await apiDownload(url, localizedPath, token, data, language);
+        await apiDownload(url, localizedPath, token, langData);
       }
 
       for (const template of localizedTemplates) {
-        for (const expanded of expandPath(template, data[language] || {})) {
-          await apiDownload(url, expanded, token, data, language);
+        for (const expanded of expandPath(template, langData)) {
+          await apiDownload(url, expanded, token, langData);
         }
       }
     }
@@ -286,6 +278,14 @@ async function localizedPaths(
       warn("WARNING: Original UI language unknown, not restoring it.");
     }
   }
+
+  return result;
+}
+
+// save the data as a pretty printed JSON file (2 spaces indentation)
+function saveJson(file: string, data: any) {
+  warn(`Writing ${file}`);
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
 // how long is the downloaded OpenAPI file valid
@@ -345,7 +345,7 @@ async function openAPIFiles(source: string): Promise<string[]> {
     .map((f) => path.join(source, f));
 }
 
-async function readOpenAPI(source: string, baseUrl: string, password: string) {
+async function readOpenAPI(source: string, baseUrl: string, password: string, outputDir: string) {
   // remove trailing slashes to avoid double slashes in the requests
   const url = baseUrl.replace(/\/+$/, "");
   const token = await login(url, password);
@@ -380,15 +380,15 @@ async function readOpenAPI(source: string, baseUrl: string, password: string) {
     }
   }
 
-  await localizedPaths(data, url, token, localized, localizedTemplates);
+  const translated = await localizedPaths(url, token, localized, localizedTemplates);
 
-  // pretty print with 2 spaces indentation
-  const result = JSON.stringify(data, null, 2);
+  fs.mkdirSync(outputDir, { recursive: true });
+  saveJson(path.join(outputDir, "dump.json"), data);
 
-  if (options.output) {
-    fs.writeFileSync(options.output, result);
-  } else {
-    console.log(result);
+  for (const language in translated) {
+    // the language comes from the server, do not allow path separators in the file name
+    const safeName = language.replace(/[^A-Za-z0-9_-]/g, "_");
+    saveJson(path.join(outputDir, `dump-${safeName}.json`), translated[language]);
   }
 
   sanityCheck(data);
@@ -397,7 +397,7 @@ async function readOpenAPI(source: string, baseUrl: string, password: string) {
 // await cannot be used at the top level, define an anonymous async function and execute it
 (async () => {
   try {
-    await readOpenAPI(options.api, options.url, options.password);
+    await readOpenAPI(options.api, options.url, options.password, options.output);
   } catch (error) {
     warn(String(error));
     if (options.debug) {
