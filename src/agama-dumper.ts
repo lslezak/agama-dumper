@@ -159,7 +159,12 @@ function isTranslated(pathItem: any): boolean {
 // Paths with parameters, it returns the list of parameter values for the given path. The values
 // are read from the (already downloaded) data of the given language.
 const pathParameters: Record<string, (data: any) => string[]> = {
-  "/api/licenses/{id}": (data) => (data["/api/system"]?.licenses || []).map((l: any) => l.id),
+  // only the licenses referenced by a product
+  "/api/licenses/{id}": (data) => {
+    const system = data["/api/system"];
+    const used = new Set<string>((system?.products || []).flatMap((p: any) => p.licenses || []));
+    return (system?.licenses || []).map((l: any) => l.id).filter((id: string) => used.has(id));
+  },
 };
 
 // expand a path with parameter, resolves to the list of concrete paths
