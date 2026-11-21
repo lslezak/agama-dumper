@@ -1,6 +1,8 @@
 #! /usr/bin/env node
 
 import path from "node:path";
+import os from "node:os";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -8,12 +10,19 @@ import https from "node:https";
 import { program } from "commander";
 import { question } from "readline-sync";
 
+// the default OpenAPI specification
+const DEFAULT_API_URL = "https://agama-project.github.io/openapi/nightly/openapi-full.json";
+
 // define command line arguments
 program
   .description("Dump the current Agama REST API data")
-  .requiredOption("-a, --api <dir>", "Agama OpenAPI specification")
+  .option(
+    "-a, --api <dir|url>",
+    "Agama OpenAPI specification: a directory with *.json files or an URL of a JSON file (downloaded files are cached for 1 hour)",
+    DEFAULT_API_URL
+  )
   .option("-d, --debug", "Enable debugging")
-  .option("-u, --url <url>", "Agama server URL", "http://localhost")
+  .option("-u, --url <url>", "Agama server URL", "https://agama.local")
   .option("-p, --password <password>", "Agama login password")
   .option("-o, --output <file>", "Save output to file (default: stdout)");
 
@@ -102,7 +111,11 @@ async function api(url: string, token: string): Promise<any> {
         chunks.push(chunk);
       });
       res.on("end", () => {
-        if (res.statusCode !== 200) {
+        if (res.statusCode === 404) {
+          // e.g. no proposal exists yet, it is a valid state
+          warn(`Not found: ${url}`);
+          resolve(null);
+        } else if (res.statusCode !== 200) {
           if (options.debug) warn(`HTTP code ${res.statusCode}, response: ${chunks.join("")}`);
           reject("Download failed");
         } else {
@@ -127,41 +140,9 @@ async function api(url: string, token: string): Promise<any> {
   });
 }
 
-// special handling for paths with parameters
-async function specialPaths(data: any, url: string, token: string) {
-  const connectionPath = "/api/network/connections";
-  const networkConnections = data[connectionPath];
-
-  if (networkConnections) {
-    for (const idx in networkConnections) {
-      if (networkConnections[idx].id) {
-        const apiPath = connectionPath + "/" + networkConnections[idx].id;
-        warn(`Downloading ${apiPath}`);
-        const res = await api(url + apiPath, token);
-        data[apiPath] = res;
-      }
-    }
-  }
-
-  const storageParamsPath = "/api/storage/product/params";
-  const storageParams = data[storageParamsPath];
-
-  if (storageParams && storageParams.mountPoints) {
-    const volumePath = "/api/storage/product/volume_for";
-    // FIXME: the web UI additionally queries the empty path, is that OK?
-    // (use a copy, do not modify the dumped data)
-    const mountPoints = [...storageParams.mountPoints, ""];
-    for (const mountPoint of mountPoints) {
-      const apiPath = volumePath + "?mount_path=" + encodeURIComponent(mountPoint);
-      warn(`Downloading ${apiPath}`);
-      const res = await api(url + apiPath, token);
-      data[apiPath] = res;
-    }
-  }
-}
-
+// check the downloaded data
 function sanityCheck(data: any) {
-  const config = data["/api/software/config"];
+  const config = data["/api/config"];
   if (!config || !config.product) {
     warn(
       "WARNING: No product is selected, some settings (storage, software) depend on selected product."
@@ -169,38 +150,26 @@ function sanityCheck(data: any) {
   }
 }
 
-// ignore these paths
-const skip = [
-  // FIXME: returns error 404, invalid OpenAPI?
-  "/api/product/issues/product",
-  // needs "id" parameter
-  "/api/network/connections/:id",
-  // needs "mount_path" query parameter
-  "/api/storage/product/volume_for",
-];
+// the paths returning localized data (i.e. depending on the current UI language) are marked
+// in the OpenAPI data with this vendor flag
+function isTranslated(pathItem: any): boolean {
+  return pathItem["x-agama-translated"] === true || pathItem.get?.["x-agama-translated"] === true;
+}
 
-// extra paths missing in the OpenAPI data
-// FIXME: add the missing data
-const extra = ["/api/software/issues/product"];
+// Paths with parameters, it returns the list of parameter values for the given path. The values
+// are read from the (already downloaded) data of the given language.
+const pathParameters: Record<string, (data: any) => string[]> = {
+  "/api/licenses/{id}": (data) => (data["/api/system"]?.licenses || []).map((l: any) => l.id),
+};
 
-// these paths return localized data (i.e. depending on the current UI language)
-// TODO: add some flag to the OpenAPI data to avoid this hard coded list?
-const localized = [
-  "/api/l10n/keymaps",
-  "/api/l10n/locales",
-  "/api/l10n/timezones",
-  "/api/software/patterns",
-  "/api/software/products",
-  "/api/storage/devices/result",
-  "/api/storage/proposal/actions",
-  "/api/users/issues",
-];
-
-async function supported(url: string, storage: string, token: string, data: any): Promise<boolean> {
-  const apiPath = `/api/storage/${storage}/supported`;
-  const result = await api(url + apiPath, token);
-  data[apiPath] = result;
-  return result === true;
+// expand a path with parameter, resolves to the list of concrete paths
+function expandPath(name: string, data: any): string[] {
+  const values = pathParameters[name];
+  if (!values) {
+    warn(`Skipping ${name}: unknown parameter values`);
+    return [];
+  }
+  return values(data).map((value) => name.replace(/\{[^}]+\}/, encodeURIComponent(value)));
 }
 
 async function apiDownload(
@@ -225,13 +194,8 @@ async function apiDownload(
   }
 }
 
-async function extraPaths(data: any, url: string, token: string) {
-  for (const idx in extra) {
-    await apiDownload(url, extra[idx], token, data);
-  }
-}
-
-async function switchLanguage(url: string, token: string, language: string) {
+// run an installer action, see the POST /api/action in the OpenAPI specification
+async function runAction(url: string, token: string, action: any) {
   const downloader = url.startsWith("https://") ? https : http;
   const httpOptions = {
     // ignore HTTPS errors (self-signed certificate)
@@ -240,15 +204,18 @@ async function switchLanguage(url: string, token: string, language: string) {
       "Content-Type": "application/json",
       authorization: "Bearer " + token,
     },
-    method: "PATCH",
+    method: "POST",
   };
 
   return new Promise((resolve, reject) => {
-    const req = downloader.request(url + "/api/l10n/config", httpOptions, (res) => {
-      res.on("data", () => {});
+    const chunks: any[] = [];
+    const req = downloader.request(url + "/api/action", httpOptions, (res) => {
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => chunks.push(chunk));
       res.on("end", () => {
         if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-          reject("Changing language failed");
+          if (options.debug) warn(`HTTP code ${res.statusCode}, response: ${chunks.join("")}`);
+          reject("Running the action failed");
         } else {
           resolve(null);
         }
@@ -259,13 +226,22 @@ async function switchLanguage(url: string, token: string, language: string) {
     });
 
     // write request body
-    const body = JSON.stringify({ uiLocale: language });
-    req.write(body);
+    req.write(JSON.stringify(action));
     req.end();
   });
 }
 
-async function localizedPaths(data: any, url: string, token: string) {
+function switchLanguage(url: string, token: string, language: string) {
+  return runAction(url, token, { configureL10n: { locale: language } });
+}
+
+async function localizedPaths(
+  data: any,
+  url: string,
+  token: string,
+  localized: string[],
+  localizedTemplates: string[]
+) {
   const apiPath = "/languages.json";
   warn(`Downloading ${apiPath}`);
   const languages = await api(url + apiPath, token);
@@ -276,20 +252,25 @@ async function localizedPaths(data: any, url: string, token: string) {
   }
 
   // remember the original language to restore it at the end
-  const configPath = "/api/l10n/config";
-  const config = await api(url + configPath, token);
-  const originalLanguage: string | undefined = config?.uiLocale;
+  const system = await api(url + "/api/system", token);
+  const originalLanguage: string | undefined = system?.l10n?.locale;
 
   try {
     for (const language in languages) {
       const [lang, country] = language.split("-", 2);
       // the country part is optional
-      const uiLanguage = (country ? lang + "_" + country : lang) + ".UTF-8";
+      const uiLanguage = (country ? lang + "_" + country.toUpperCase() : lang) + ".UTF-8";
       warn("Switching UI language to " + uiLanguage);
       await switchLanguage(url, token, uiLanguage);
 
-      for (const idx in localized) {
-        await apiDownload(url, localized[idx], token, data, language);
+      for (const localizedPath of localized) {
+        await apiDownload(url, localizedPath, token, data, language);
+      }
+
+      for (const template of localizedTemplates) {
+        for (const expanded of expandPath(template, data[language] || {})) {
+          await apiDownload(url, expanded, token, data, language);
+        }
       }
     }
   } finally {
@@ -307,41 +288,99 @@ async function localizedPaths(data: any, url: string, token: string) {
   }
 }
 
-async function readOpenAPI(dir: string, baseUrl: string, password: string) {
+// how long is the downloaded OpenAPI file valid
+const CACHE_MAX_AGE_MS = 60 * 60 * 1000;
+
+// download the OpenAPI file from an URL, use a local cache, resolves to the local file name
+async function cachedDownload(apiUrl: string): Promise<string> {
+  const cacheHome = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+  const cacheDir = path.join(cacheHome, "agama-dumper");
+  const hash = crypto.createHash("sha256").update(apiUrl).digest("hex").slice(0, 16);
+  const cacheFile = path.join(cacheDir, `${hash}.json`);
+
+  let stat: fs.Stats | undefined;
+  try {
+    stat = fs.statSync(cacheFile);
+  } catch {
+    // not cached yet
+  }
+
+  if (stat && Date.now() - stat.mtimeMs < CACHE_MAX_AGE_MS) {
+    warn(`Using cached ${apiUrl} (${cacheFile})`);
+    return cacheFile;
+  }
+
+  warn(`Downloading ${apiUrl}`);
+  try {
+    const res = await fetch(apiUrl);
+    if (!res.ok) throw new Error(`HTTP code ${res.status}`);
+    const body = await res.text();
+    // check that it is a valid JSON before caching it
+    JSON.parse(body);
+
+    fs.mkdirSync(cacheDir, { recursive: true });
+    // write atomically, do not leave a partial file in the cache
+    const tmpFile = `${cacheFile}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpFile, body);
+    fs.renameSync(tmpFile, cacheFile);
+    return cacheFile;
+  } catch (error) {
+    if (stat) {
+      warn(`WARNING: Download of ${apiUrl} failed (${error}), using the outdated cache`);
+      return cacheFile;
+    }
+    throw new Error(`Cannot download ${apiUrl}: ${error}`);
+  }
+}
+
+// returns the list of OpenAPI files to read
+async function openAPIFiles(source: string): Promise<string[]> {
+  if (/^https?:\/\//.test(source)) {
+    return [await cachedDownload(source)];
+  }
+  // sort the files to get a stable output
+  return fs
+    .globSync("*.json", { cwd: source })
+    .sort()
+    .map((f) => path.join(source, f));
+}
+
+async function readOpenAPI(source: string, baseUrl: string, password: string) {
   // remove trailing slashes to avoid double slashes in the requests
   const url = baseUrl.replace(/\/+$/, "");
   const token = await login(url, password);
-  // sort the files to get a stable output
-  const files = fs.globSync("*.json", { cwd: dir }).sort();
-  let data: any = {};
+  const files = await openAPIFiles(source);
+  const data: any = {};
+  // paths with translated data, downloaded separately for each language
+  const localized: string[] = [];
+  // the same, but paths with parameters
+  const localizedTemplates: string[] = [];
 
-  // check if ZFCP and DASD devices are supported (S390 mainframe only)
-  const zfcp = await supported(url, "zfcp", token, data);
-  const dasd = await supported(url, "dasd", token, data);
-
-  for (const idx in files) {
-    const fullPath = path.join(dir, files[idx]);
-    const apiData = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
+  for (const file of files) {
+    const apiData = JSON.parse(fs.readFileSync(file, "utf-8"));
     const paths = apiData.paths || {};
     for (const name in paths) {
-      if (paths[name].get) {
-        if (
-          skip.includes(name) ||
-          localized.includes(name) ||
-          (!zfcp && name.match(/zfcp/)) ||
-          (!dasd && name.match(/dasd/))
-        ) {
-          warn(`Skipping ${name}`);
+      if (!paths[name].get) continue;
+
+      // not a data path, it only checks the login session
+      if (name === "/api/auth") continue;
+
+      if (name.includes("{")) {
+        // paths with parameters need special handling
+        if (isTranslated(paths[name])) {
+          localizedTemplates.push(name);
         } else {
-          await apiDownload(url, name, token, data);
+          warn(`Skipping ${name}`);
         }
+      } else if (isTranslated(paths[name])) {
+        localized.push(name);
+      } else {
+        await apiDownload(url, name, token, data);
       }
     }
   }
 
-  await specialPaths(data, url, token);
-  await extraPaths(data, url, token);
-  await localizedPaths(data, url, token);
+  await localizedPaths(data, url, token, localized, localizedTemplates);
 
   // pretty print with 2 spaces indentation
   const result = JSON.stringify(data, null, 2);
